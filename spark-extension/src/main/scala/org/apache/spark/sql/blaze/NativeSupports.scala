@@ -51,6 +51,8 @@ trait NativeSupports extends SparkPlan {
 }
 
 object NativeSupports extends Logging {
+  private var nativeInitialized: Boolean = false
+
   @tailrec def isNative(plan: SparkPlan): Boolean =
     plan match {
       case _: NativeSupports => true
@@ -134,26 +136,28 @@ object NativeSupports extends Logging {
       .setPlan(nativePlan)
       .build()
 
-    // note: consider passing a ByteBufferOutputStream to blaze-rs to avoid copying
+    val conf = SparkEnv.get.conf
+    val batchSize = conf.getLong("spark.blaze.batchSize", 16384);
+    val nativeMemory = conf.getLong("spark.executor.memoryOverhead", Long.MaxValue) * 1024 * 1024;
+    val memoryFraction = conf.getDouble("spark.blaze.memoryFraction", 0.75);
+    val tmpDirs = SparkEnv.get.blockManager.diskBlockManager.localDirsString.mkString(",")
+
+    NativeSupports.synchronized {
+      if (!NativeSupports.nativeInitialized) {
+        logInfo(s"Initializing native environment ...")
+        System.loadLibrary("blaze")
+        JniBridge.initNative(batchSize, nativeMemory, memoryFraction, tmpDirs)
+        NativeSupports.nativeInitialized = true
+      }
+    }
+
     if (SparkEnv.get.conf.getBoolean("spark.blaze.dumpNativePlanBeforeExecuting", false)) {
       logInfo(s"Start executing native plan: ${taskDefinition.toString}")
     } else {
       logInfo(s"Start executing native plan")
     }
 
-    val nativeMemory = SparkEnv.get.conf
-      .getLong("spark.executor.memoryOverhead", Long.MaxValue) * 1024 * 1024
-    val memoryFraction = SparkEnv.get.conf.getDouble("spark.blaze.memoryFraction", 0.75)
-    val batchSize = SparkEnv.get.conf.getLong("spark.blaze.batchSize", 16384)
-    val tokioPoolSize = SparkEnv.get.conf.getLong("spark.blaze.tokioPoolSize", 10)
-    val tmpDirs = SparkEnv.get.blockManager.diskBlockManager.localDirsString.mkString(",")
-    JniBridge.callNative(
-      taskDefinition.toByteArray,
-      tokioPoolSize,
-      batchSize,
-      nativeMemory,
-      memoryFraction,
-      tmpDirs)
+    JniBridge.callNative(taskDefinition.toByteArray);
   }
 }
 

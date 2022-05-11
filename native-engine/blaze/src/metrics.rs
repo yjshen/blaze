@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
-use jni::errors::Result as JniResult;
+
 use jni::objects::{JClass, JObject};
 use jni::JNIEnv;
 
 use datafusion_ext::jni_bridge::JavaClasses;
 use datafusion_ext::{
-    jni_bridge_call_method, jni_bridge_call_static_method_no_check_java_exception,
-    jni_bridge_new_object,
+    jni_bridge_call_method, jni_bridge_call_static_method, jni_bridge_new_object,
+    jni_map_error,
 };
 
 use crate::BlazeIter;
@@ -41,9 +41,9 @@ pub extern "system" fn Java_org_apache_spark_sql_blaze_JniBridge_updateMetrics(
                 blaze_iter.execution_plan
             );
             let msg_jstr = env.new_string(msg).unwrap();
-            let _throw = jni_bridge_call_static_method_no_check_java_exception!(
+            let _throw = jni_bridge_call_static_method!(
                 env,
-                JniBridge.raiseThrowable,
+                JniBridge.raiseThrowable -> (),
                 jni_bridge_new_object!(
                     env,
                     JavaRuntimeException,
@@ -60,7 +60,7 @@ fn update_spark_metric_node(
     env: &JNIEnv,
     metric_node: JObject,
     execution_plan: Arc<dyn ExecutionPlan>,
-) -> JniResult<()> {
+) -> datafusion::error::Result<()> {
     // update current node
     update_metrics(
         env,
@@ -78,11 +78,10 @@ fn update_spark_metric_node(
     for (i, child_plan) in execution_plan.children().iter().enumerate() {
         let child_metric_node = jni_bridge_call_method!(
             env,
-            SparkMetricNode.getChild,
+            SparkMetricNode.getChild -> JObject,
             metric_node,
             i as i32
-        )?
-        .l()?;
+        )?;
         update_spark_metric_node(env, child_metric_node, child_plan.clone())?;
     }
     Ok(())
@@ -92,11 +91,11 @@ fn update_metrics(
     env: &JNIEnv,
     metric_node: JObject,
     metric_values: &[(&str, i64)],
-) -> JniResult<()> {
+) -> datafusion::error::Result<()> {
     for &(name, value) in metric_values {
         if REPORTED_METRICS.contains(&name) {
-            let jname = env.new_string(name)?;
-            jni_bridge_call_method!(env, SparkMetricNode.add, metric_node, jname, value)?;
+            let jname = jni_map_error!(env.new_string(name))?;
+            jni_bridge_call_method!(env, SparkMetricNode.add -> (), metric_node, jname, value)?;
         }
     }
     Ok(())

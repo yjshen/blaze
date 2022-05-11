@@ -188,8 +188,6 @@ case class ArrowShuffleExchangeExec301(
       rdd.dependencies,
       (partition, taskContext) => {
         // store fetch iterator in jni resource before native compute
-        logWarning(
-          s"FUCK NativeShuffleReader: stageId=${taskContext.stageId()}, partId: ${partition.index}")
         rdd.compute(rdd.partitions(partition.index), taskContext)
 
         PhysicalPlanNode

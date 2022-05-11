@@ -1,4 +1,3 @@
-use datafusion::arrow::datatypes::Schema;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +8,8 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use lazy_static::lazy_static;
 use log::LevelFilter;
-use simplelog::{ConfigBuilder, SimpleLogger, ThreadLogMode};
+use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode, ThreadLogMode};
+use tokio::runtime::Runtime;
 
 mod exec;
 mod metrics;
@@ -25,7 +25,12 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 pub struct BlazeIter {
     pub stream: SendableRecordBatchStream,
     pub execution_plan: Arc<dyn ExecutionPlan>,
-    pub renamed_schema: Arc<Schema>,
+    pub runtime: Arc<Runtime>,
+}
+
+lazy_static! {
+    pub static ref LOGGING_INIT: Mutex<Option<()>> = Mutex::default();
+    pub static ref SESSIONCTX: Mutex<Option<Arc<SessionContext>>> = Mutex::default();
 }
 
 pub fn init_session_ctx(
@@ -34,10 +39,7 @@ pub fn init_session_ctx(
     batch_size: usize,
     tmp_dirs: String,
 ) -> Arc<SessionContext> {
-    lazy_static! {
-        static ref SESSION_CTX: Mutex<Option<Arc<SessionContext>>> = Mutex::default();
-    }
-    let mut session_ctx = SESSION_CTX.lock().unwrap();
+    let mut session_ctx = SESSIONCTX.lock().unwrap();
     if session_ctx.is_none() {
         let dirs = tmp_dirs.split(',').map(PathBuf::from).collect::<Vec<_>>();
         let runtime_config = RuntimeConfig::new()
@@ -54,16 +56,17 @@ pub fn init_session_ctx(
 }
 
 pub fn init_logging() {
-    lazy_static! {
-        static ref LOGGING_INIT: Mutex<Option<()>> = Mutex::default();
-    }
-
     let mut logging_init = LOGGING_INIT.lock().unwrap();
     if logging_init.is_none() {
-        let config = ConfigBuilder::new()
-            .set_thread_mode(ThreadLogMode::Both)
-            .build();
-        SimpleLogger::init(LevelFilter::Info, config).unwrap();
+        TermLogger::init(
+            LevelFilter::Info,
+            ConfigBuilder::new()
+                .set_thread_mode(ThreadLogMode::Both)
+                .build(),
+            TerminalMode::Stderr,
+            ColorChoice::Never,
+        )
+        .unwrap();
         *logging_init = Some(());
     }
 }

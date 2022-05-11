@@ -17,7 +17,13 @@
 
 package org.apache.spark.sql.blaze
 
+import java.util.concurrent.Exchanger
+import java.util.concurrent.LinkedTransferQueue
+
 import scala.collection.JavaConverters._
+import scala.concurrent.Await
+import scala.concurrent.Promise
+import scala.concurrent.duration.Duration
 
 import org.apache.arrow.c.ArrowArray
 import org.apache.arrow.c.ArrowSchema
@@ -68,13 +74,14 @@ object FFIHelper {
     val allocator =
       ArrowUtils2.rootAllocator.newChildAllocator("fromBLZIterator", 0, Long.MaxValue)
     val provider = new CDataDictionaryProvider()
+    val nativeBlazeIterWrapper = new NativeBlazeIterWrapper(iterPtr)
 
     val root = tryWithResource(ArrowSchema.allocateNew(allocator)) { consumerSchema =>
       tryWithResource(ArrowArray.allocateNew(allocator)) { consumerArray =>
         val schemaPtr: Long = consumerSchema.memoryAddress
         val arrayPtr: Long = consumerArray.memoryAddress
-        val rt = JniBridge.loadNext(iterPtr, schemaPtr, arrayPtr)
-        if (rt < 0) {
+        val hasNext = nativeBlazeIterWrapper.nextBatch(schemaPtr, arrayPtr)
+        if (!hasNext) {
           return CompletionIterator[ColumnarBatch, Iterator[ColumnarBatch]](
             Iterator.empty, {
               JniBridge.updateMetrics(iterPtr, metrics)
@@ -107,8 +114,8 @@ object FFIHelper {
             tryWithResource(ArrowArray.allocateNew(allocator)) { consumerArray =>
               val schemaPtr: Long = consumerSchema.memoryAddress
               val arrayPtr: Long = consumerArray.memoryAddress
-              val rt = JniBridge.loadNext(iterPtr, schemaPtr, arrayPtr)
-              if (rt < 0) {
+              val hasNext = nativeBlazeIterWrapper.nextBatch(schemaPtr, arrayPtr)
+              if (!hasNext) {
                 finish()
                 return false
               }
@@ -130,6 +137,21 @@ object FFIHelper {
           root.close()
         }
       }
+    }
+  }
+}
+
+class NativeBlazeIterWrapper(iterPtr: Long) {
+  private val inputExchanger = new Exchanger[Object]()
+  private val outputExchanger = new Exchanger[Object]()
+
+  JniBridge.loadBatches(iterPtr, inputExchanger, outputExchanger)
+
+  def nextBatch(schemaPtr: Long, arrayPtr: Long): Boolean = {
+    inputExchanger.exchange((schemaPtr, arrayPtr))
+    outputExchanger.exchange(null) match {
+      case err: Throwable => throw err
+      case hasNext => hasNext.asInstanceOf[Boolean]
     }
   }
 }

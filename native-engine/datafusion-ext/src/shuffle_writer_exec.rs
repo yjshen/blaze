@@ -67,8 +67,8 @@ use log::debug;
 use tempfile::NamedTempFile;
 use tokio::task;
 
+use crate::batch_buffer::MutableRecordBatch;
 use crate::spark_hash::{create_hashes, pmod};
-use crate::{batch_buffer::MutableRecordBatch, util::Util};
 
 #[derive(Default)]
 struct PartitionBuffer {
@@ -323,60 +323,62 @@ impl ShuffleRepartitioner {
         std::mem::drop(_timer);
         let elapsed_compute = self.metrics.elapsed_compute().clone();
 
-        Util::to_datafusion_external_result(
-            task::spawn_blocking(move || {
-                let _timer = elapsed_compute.timer();
-                let mut offset: u64 = 0;
-                let mut offsets = vec![0; num_output_partitions + 1];
-                let mut output_data = File::create(data_file)?;
+        task::spawn_blocking(move || {
+            let _timer = elapsed_compute.timer();
+            let mut offset: u64 = 0;
+            let mut offsets = vec![0; num_output_partitions + 1];
+            let mut output_data = File::create(data_file)?;
 
-                for i in 0..num_output_partitions {
-                    offsets[i] = offset;
-                    let partition_start = output_data.seek(SeekFrom::Current(0))?;
+            for i in 0..num_output_partitions {
+                offsets[i] = offset;
+                let partition_start = output_data.seek(SeekFrom::Current(0))?;
 
-                    // write in-mem batches first if any
-                    let in_mem_batches = &output_batches[i];
-                    if !in_mem_batches.is_empty() {
-                        let mut file_writer =
-                            FileWriter::try_new(output_data, input_schema.as_ref())?;
-                        for batch in in_mem_batches {
-                            file_writer.write(batch)?;
-                        }
-                        file_writer.finish()?;
+                // write in-mem batches first if any
+                let in_mem_batches = &output_batches[i];
+                if !in_mem_batches.is_empty() {
+                    let mut file_writer =
+                        FileWriter::try_new(output_data, input_schema.as_ref())?;
+                    for batch in in_mem_batches {
+                        file_writer.write(batch)?;
+                    }
+                    file_writer.finish()?;
 
-                        output_data = file_writer.into_inner()?;
-                        let partition_end = output_data.seek(SeekFrom::Current(0))?;
-                        let ipc_length: u64 = partition_end - partition_start;
-                        output_data.write_all(&ipc_length.to_le_bytes()[..])?;
+                    output_data = file_writer.into_inner()?;
+                    let partition_end = output_data.seek(SeekFrom::Current(0))?;
+                    let ipc_length: u64 = partition_end - partition_start;
+                    output_data.write_all(&ipc_length.to_le_bytes()[..])?;
+                    output_data.flush()?;
+                    offset = partition_start + ipc_length + 8;
+                }
+
+                // append partition in each spills
+                for spill in &output_spills {
+                    let length = spill.offsets[i + 1] - spill.offsets[i];
+                    if length > 0 {
+                        let spill_file = File::open(&spill.file.path())?;
+                        let mut reader = &spill_file;
+                        reader.seek(SeekFrom::Start(spill.offsets[i]))?;
+                        let mut take = reader.take(length);
+                        std::io::copy(&mut take, &mut output_data)?;
                         output_data.flush()?;
-                        offset = partition_start + ipc_length + 8;
                     }
+                    offset += length;
+                }
+            }
+            // add one extra offset at last to ease partition length computation
+            offsets[num_output_partitions] = offset;
+            let mut output_index = File::create(index_file)?;
+            for offset in offsets {
+                output_index.write_all(&(offset as i64).to_le_bytes()[..])?;
+            }
+            output_index.flush()?;
+            Ok::<(), DataFusionError>(())
+        })
+        .await
+        .map_err(|e| {
+            DataFusionError::Execution(format!("shuffle write error: {:?}", e))
+        })??;
 
-                    // append partition in each spills
-                    for spill in &output_spills {
-                        let length = spill.offsets[i + 1] - spill.offsets[i];
-                        if length > 0 {
-                            let spill_file = File::open(&spill.file.path())?;
-                            let mut reader = &spill_file;
-                            reader.seek(SeekFrom::Start(spill.offsets[i]))?;
-                            let mut take = reader.take(length);
-                            std::io::copy(&mut take, &mut output_data)?;
-                            output_data.flush()?;
-                        }
-                        offset += length;
-                    }
-                }
-                // add one extra offset at last to ease partition length computation
-                offsets[num_output_partitions] = offset;
-                let mut output_index = File::create(index_file)?;
-                for offset in offsets {
-                    output_index.write_all(&(offset as i64).to_le_bytes()[..])?;
-                }
-                output_index.flush()?;
-                Ok::<(), DataFusionError>(())
-            })
-            .await,
-        )??;
         let used = self.metrics.mem_used().set(0);
         self.shrink(used);
 
